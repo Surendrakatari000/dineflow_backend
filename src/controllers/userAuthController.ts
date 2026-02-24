@@ -119,12 +119,10 @@ export const register = async (req: Request, res: Response) => {
     console.log("[REGISTER] Catch block triggered. Rolling back...");
     await connection.rollback();
     logError("Register", err);
-    res
-      .status(500)
-      .json({
-        success: false,
-        message: `Register error: ${err instanceof Error ? err.message : String(err)}`,
-      });
+    res.status(500).json({
+      success: false,
+      message: `Register error: ${err instanceof Error ? err.message : String(err)}`,
+    });
   } finally {
     connection.release();
     console.log("[REGISTER] Connection released.");
@@ -209,12 +207,10 @@ export const verifyOTP = async (req: Request, res: Response) => {
     console.log("[VERIFY-OTP] Catch block triggered. Rolling back...");
     await connection.rollback();
     logError("VerifyOTP", err);
-    res
-      .status(500)
-      .json({
-        success: false,
-        message: `Verification failed: ${err instanceof Error ? err.message : String(err)}`,
-      });
+    res.status(500).json({
+      success: false,
+      message: `Verification failed: ${err instanceof Error ? err.message : String(err)}`,
+    });
   } finally {
     connection.release();
     console.log("[VERIFY-OTP] Connection released.");
@@ -273,12 +269,10 @@ export const login = async (req: Request, res: Response) => {
     res.status(200).json({ success: true, message: "Login successful" });
   } catch (err) {
     logError("Login", err);
-    res
-      .status(500)
-      .json({
-        success: false,
-        message: `Login error: ${err instanceof Error ? err.message : String(err)}`,
-      });
+    res.status(500).json({
+      success: false,
+      message: `Login error: ${err instanceof Error ? err.message : String(err)}`,
+    });
   }
 };
 
@@ -326,12 +320,10 @@ export const forgotPassword = async (req: Request, res: Response) => {
       .json({ success: true, message: "If account exists, OTP sent" });
   } catch (err) {
     logError("ForgotPassword", err);
-    res
-      .status(500)
-      .json({
-        success: false,
-        message: `Error: ${err instanceof Error ? err.message : String(err)}`,
-      });
+    res.status(500).json({
+      success: false,
+      message: `Error: ${err instanceof Error ? err.message : String(err)}`,
+    });
   }
 };
 
@@ -373,6 +365,31 @@ export const resetPassword = async (req: Request, res: Response) => {
       return res.status(401).json({ success: false, message: "Invalid OTP" });
     }
 
+    // --- NEW: OLD PASSWORD DETECTION START ---
+    console.log(
+      "[RESET-PASSWORD] Checking if new password matches old password...",
+    );
+    const [userRows] = await connection.query<UserRow[]>(
+      "SELECT password FROM users WHERE email=? FOR UPDATE",
+      [email],
+    );
+
+    if (userRows.length > 0) {
+      const isSamePassword = await bcrypt.compare(
+        newPassword,
+        userRows[0].password,
+      );
+      if (isSamePassword) {
+        console.log("[RESET-PASSWORD] Same password detected. Rolling back...");
+        await connection.rollback();
+        return res.status(400).json({
+          success: false,
+          message: "New password cannot be the same as your current password",
+        });
+      }
+    }
+    // --- NEW: OLD PASSWORD DETECTION END ---
+
     console.log("[RESET-PASSWORD] Hashing new password and updating user...");
     const hashed = await bcrypt.hash(newPassword, 10);
     await connection.query(`UPDATE users SET password=? WHERE email=?`, [
@@ -393,18 +410,15 @@ export const resetPassword = async (req: Request, res: Response) => {
     console.log("[RESET-PASSWORD] Catch block triggered.");
     await connection.rollback();
     logError("ResetPassword", err);
-    res
-      .status(500)
-      .json({
-        success: false,
-        message: `Reset failed: ${err instanceof Error ? err.message : String(err)}`,
-      });
+    res.status(500).json({
+      success: false,
+      message: `Reset failed: ${err instanceof Error ? err.message : String(err)}`,
+    });
   } finally {
     connection.release();
     console.log("[RESET-PASSWORD] Connection released.");
   }
 };
-
 /*
 RESEND OTP
 */
@@ -474,12 +488,10 @@ export const resendOTP = async (req: Request, res: Response) => {
     console.log("[RESEND-OTP] Catch block triggered.");
     await connection.rollback();
     logError("ResendOTP", err);
-    res
-      .status(500)
-      .json({
-        success: false,
-        message: `Resend error: ${err instanceof Error ? err.message : String(err)}`,
-      });
+    res.status(500).json({
+      success: false,
+      message: `Resend error: ${err instanceof Error ? err.message : String(err)}`,
+    });
   } finally {
     connection.release();
     console.log("[RESEND-OTP] Connection released.");
@@ -504,8 +516,75 @@ export const logout = (req: Request, res: Response) => {
 
 
 
+/*
+RESET PASSWORD
+*/
+// export const resetPassword = async (req: Request, res: Response) => {
+//   console.log("[RESET-PASSWORD] Starting...");
+//   const email = normalizeEmail(req.body.email || "");
+//   const { otp, password: newPassword } = req.body;
 
+//   if (String(otp).length !== 6) {
+//     console.log("[RESET-PASSWORD] Validation failed: OTP length");
+//     return res
+//       .status(400)
+//       .json({ success: false, message: "Invalid OTP format" });
+//   }
 
+//   const connection = await pool.getConnection();
+//   try {
+//     console.log("[RESET-PASSWORD] Starting transaction...");
+//     await connection.beginTransaction();
+
+//     const [rows] = await connection.query<OTPRow[]>(
+//       `SELECT otp_hash FROM otp_codes WHERE email=? AND purpose='reset_password' AND expires_at > NOW() FOR UPDATE`,
+//       [email],
+//     );
+
+//     if (rows.length === 0) {
+//       console.log("[RESET-PASSWORD] OTP expired/invalid. Rolling back...");
+//       await connection.rollback();
+//       return res.status(410).json({ success: false, message: "OTP expired" });
+//     }
+
+//     const valid = await bcrypt.compare(String(otp), rows[0].otp_hash);
+//     if (!valid) {
+//       console.log("[RESET-PASSWORD] OTP mismatch. Rolling back...");
+//       await connection.rollback();
+//       return res.status(401).json({ success: false, message: "Invalid OTP" });
+//     }
+
+//     console.log("[RESET-PASSWORD] Hashing new password and updating user...");
+//     const hashed = await bcrypt.hash(newPassword, 10);
+//     await connection.query(`UPDATE users SET password=? WHERE email=?`, [
+//       hashed,
+//       email,
+//     ]);
+//     await connection.query(
+//       `DELETE FROM otp_codes WHERE email=? AND purpose='reset_password'`,
+//       [email],
+//     );
+
+//     console.log("[RESET-PASSWORD] Committing...");
+//     await connection.commit();
+//     res
+//       .status(200)
+//       .json({ success: true, message: "Password updated successfully" });
+//   } catch (err) {
+//     console.log("[RESET-PASSWORD] Catch block triggered.");
+//     await connection.rollback();
+//     logError("ResetPassword", err);
+//     res
+//       .status(500)
+//       .json({
+//         success: false,
+//         message: `Reset failed: ${err instanceof Error ? err.message : String(err)}`,
+//       });
+//   } finally {
+//     connection.release();
+//     console.log("[RESET-PASSWORD] Connection released.");
+//   }
+// };
 
 // import { Request, Response } from "express";
 // import bcrypt from "bcrypt";
