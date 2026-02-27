@@ -7,9 +7,7 @@ import { pool } from "../config/db.js";
 import { sendOTPEmail } from "../config/mailer.js";
 import { generateToken } from "../utils/jwt.js";
 
-/*
-INTERFACES
-*/
+/* INTERFACES */
 interface UserRow extends RowDataPacket {
   id: number;
   name: string;
@@ -24,497 +22,2183 @@ interface OTPRow extends RowDataPacket {
   expires_at: Date;
 }
 
-/*
-REGEX & UTILS
-*/
-const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
-const passwordRegex = /^(?=.*[A-Za-z])(?=.*\d)[A-Za-z\d]{8,}$/;
-const mobileRegex = /^[0-9]{10}$/;
-
+/* UTILS */
 const normalizeEmail = (email: string) => email.trim().toLowerCase();
-
 const logError = (context: string, err: any) => {
   console.error(`[ERROR][${new Date().toISOString()}] ${context}:`, err);
 };
 
-/*
-REGISTER
-*/
+/* GET ME (CHECK AUTH) */
+export const getMe = async (req: Request, res: Response) => {
+  try {
+    const userId = (req as any).user.id;
+    console.log(`[GET-ME] Checking auth for UserID: ${userId}`);
+
+    const [rows] = await pool.execute<RowDataPacket[]>(
+      "SELECT id, name, email, mobile_no FROM users WHERE id = ?",
+      [userId],
+    );
+
+    if (rows.length === 0) {
+      console.log(`[GET-ME] User ${userId} not found in database.`);
+      return res
+        .status(404)
+        .json({ success: false, message: "User not found" });
+    }
+
+    console.log(`[GET-ME] Success! Found user: ${rows[0].email}`);
+    res.status(200).json({ success: true, user: rows[0] });
+  } catch (error: any) {
+    logError("getMe", error);
+    res.status(500).json({ success: false, message: "Server Error" });
+  }
+};
+
+/* REGISTER */
 export const register = async (req: Request, res: Response) => {
-  console.log("[REGISTER] Starting registration process...");
+  console.log("[REGISTER] Process initiated...");
   const { name, password, mobile_no } = req.body;
   const email = normalizeEmail(req.body.email || "");
 
-  console.log(`[REGISTER] Input received: email=${email}, name=${name}`);
-
-  if (!name || !email || !password || !mobile_no) {
-    console.log("[REGISTER] Validation failed: Missing fields");
-    return res
-      .status(400)
-      .json({ success: false, message: "All fields required" });
-  }
-
-  if (!emailRegex.test(email)) {
-    console.log("[REGISTER] Validation failed: Invalid email format");
-    return res
-      .status(400)
-      .json({ success: false, message: "Invalid email format" });
-  }
-
   const connection = await pool.getConnection();
   try {
-    console.log(
-      "[REGISTER] Database connection acquired. Starting transaction...",
-    );
+    console.log(`[REGISTER] Validating email: ${email}`);
     await connection.beginTransaction();
 
-    console.log("[REGISTER] Checking if email exists...");
     const [exist] = await connection.query<UserRow[]>(
-      "SELECT id FROM users WHERE email=? FOR UPDATE",
+      "SELECT id, is_verified FROM users WHERE email=? FOR UPDATE",
       [email],
     );
 
     if (exist.length > 0) {
-      console.log("[REGISTER] Email already exists. Rolling back...");
+      console.log(
+        `[REGISTER] Email ${email} already exists. Verified: ${exist[0].is_verified}`,
+      );
+      if (exist[0].is_verified === 0) {
+        await connection.rollback();
+        return res.status(400).json({
+          success: false,
+          message:
+            "Email is already registered but not verified. Please go to the verify page.",
+        });
+      }
       await connection.rollback();
       return res
         .status(409)
         .json({ success: false, message: "Email already registered" });
     }
 
-    console.log("[REGISTER] Hashing password...");
+    console.log("[REGISTER] Hashing password and inserting user...");
     const hashed = await bcrypt.hash(password, 10);
-
-    console.log("[REGISTER] Inserting new user...");
     await connection.query<ResultSetHeader>(
-      `INSERT INTO users (name, email, password, mobile_no, is_verified) VALUES (?, ?, ?, ?, 0)`,
+      "INSERT INTO users (name, email, password, mobile_no, is_verified) VALUES (?, ?, ?, ?, 0)",
       [name, email, hashed, mobile_no],
     );
 
-    console.log("[REGISTER] Generating secure OTP...");
     const otp = crypto.randomInt(100000, 999999);
     const otpHash = await bcrypt.hash(String(otp), 10);
 
-    console.log("[REGISTER] Cleaning old OTPs and inserting new one...");
+    console.log("[REGISTER] Storing OTP code...");
     await connection.query(
-      `DELETE FROM otp_codes WHERE email=? AND purpose='register'`,
+      "DELETE FROM otp_codes WHERE email=? AND purpose='register'",
       [email],
     );
     await connection.query(
-      `INSERT INTO otp_codes (email, role, purpose, otp_hash, expires_at) VALUES (?, 'user', 'register', ?, DATE_ADD(NOW(), INTERVAL 5 MINUTE))`,
+      "INSERT INTO otp_codes (email, role, purpose, otp_hash, expires_at) VALUES (?, 'user', 'register', ?, DATE_ADD(NOW(), INTERVAL 5 MINUTE))",
       [email, otpHash],
     );
 
-    console.log("[REGISTER] Committing transaction...");
     await connection.commit();
-
-    console.log("[REGISTER] Attempting to send OTP email...");
+    console.log("[REGISTER] Committed. Sending email...");
     await sendOTPEmail(email, otp);
 
-    console.log("[REGISTER] Success. Response sent.");
     res
       .status(201)
       .json({ success: true, message: "Registration successful. OTP sent" });
   } catch (err) {
-    console.log("[REGISTER] Catch block triggered. Rolling back...");
     await connection.rollback();
     logError("Register", err);
-    res.status(500).json({
-      success: false,
-      message: `Register error: ${err instanceof Error ? err.message : String(err)}`,
-    });
+    res.status(500).json({ success: false, message: "Internal server error" });
   } finally {
     connection.release();
-    console.log("[REGISTER] Connection released.");
   }
 };
 
-/*
-VERIFY OTP
-*/
+/* VERIFY OTP (REGISTRATION) */
 export const verifyOTP = async (req: Request, res: Response) => {
-  console.log("[VERIFY-OTP] Starting verification...");
+  console.log("[VERIFY-OTP] Verification attempt started...");
   const email = normalizeEmail(req.body.email || "");
   const { otp } = req.body;
 
-  if (!otp || String(otp).length !== 6) {
-    console.log("[VERIFY-OTP] Validation failed: Invalid OTP length");
-    return res
-      .status(400)
-      .json({ success: false, message: "Invalid OTP length" });
-  }
-
   const connection = await pool.getConnection();
   try {
-    console.log("[VERIFY-OTP] Connection acquired. Starting transaction...");
     await connection.beginTransaction();
-
-    console.log("[VERIFY-OTP] Fetching OTP from database...");
-    const [rows] = await connection.query<OTPRow[]>(
-      `SELECT otp_hash FROM otp_codes WHERE email=? AND purpose='register' AND expires_at > NOW() FOR UPDATE`,
+    const [userStatus] = await connection.query<UserRow[]>(
+      "SELECT id, is_verified FROM users WHERE email=? FOR UPDATE",
       [email],
     );
 
-    if (rows.length === 0) {
-      console.log("[VERIFY-OTP] No valid/unexpired OTP found. Rolling back...");
+    if (userStatus.length > 0 && userStatus[0].is_verified === 1) {
+      console.log("[VERIFY-OTP] User already verified.");
+      const token = generateToken(userStatus[0].id);
+      res.cookie("token", token, {
+        httpOnly: true,
+        secure: true,
+        sameSite: "strict",
+        maxAge: 604800000,
+      });
+      await connection.commit();
+      return res
+        .status(200)
+        .json({
+          success: true,
+          message: "Account already verified",
+          user: userStatus[0],
+        });
+    }
+
+    const [rows] = await connection.query<OTPRow[]>(
+      "SELECT otp_hash FROM otp_codes WHERE email=? AND purpose='register' AND expires_at > NOW() FOR UPDATE",
+      [email],
+    );
+
+    if (
+      rows.length === 0 ||
+      !(await bcrypt.compare(String(otp), rows[0].otp_hash))
+    ) {
+      console.log("[VERIFY-OTP] Invalid/Expired OTP.");
       await connection.rollback();
       return res
-        .status(410)
-        .json({ success: false, message: "OTP expired or not found" });
+        .status(401)
+        .json({ success: false, message: "Incorrect or expired OTP" });
     }
 
-    console.log("[VERIFY-OTP] Comparing OTP hash...");
-    const valid = await bcrypt.compare(String(otp), rows[0].otp_hash);
-    if (!valid) {
-      console.log("[VERIFY-OTP] OTP mismatch. Rolling back...");
-      await connection.rollback();
-      return res.status(401).json({ success: false, message: "Incorrect OTP" });
-    }
-
-    console.log(
-      "[VERIFY-OTP] OTP valid. Updating user status and deleting code...",
-    );
-    await connection.query(`UPDATE users SET is_verified=1 WHERE email=?`, [
+    await connection.query("UPDATE users SET is_verified=1 WHERE email=?", [
       email,
     ]);
     await connection.query(
-      `DELETE FROM otp_codes WHERE email=? AND purpose='register'`,
+      "DELETE FROM otp_codes WHERE email=? AND purpose='register'",
       [email],
     );
-
-    const [userRows] = await connection.query<UserRow[]>(
-      "SELECT id FROM users WHERE email=?",
-      [email],
-    );
-
-    console.log("[VERIFY-OTP] Committing transaction...");
     await connection.commit();
 
-    console.log("[VERIFY-OTP] Generating JWT and setting cookie...");
-    const token = generateToken(userRows[0].id);
+    const token = generateToken(userStatus[0].id);
     res.cookie("token", token, {
       httpOnly: true,
-      secure: process.env.NODE_ENV === "production",
+      secure: true,
       sameSite: "strict",
-      maxAge: 7 * 24 * 60 * 60 * 1000,
+      maxAge: 604800000,
     });
 
-    console.log("[VERIFY-OTP] Verification success.");
+    console.log("[VERIFY-OTP] Verification Success.");
     res
       .status(200)
-      .json({ success: true, message: "Account verified successfully" });
+      .json({
+        success: true,
+        message: "Account verified successfully",
+        user: userStatus[0],
+      });
   } catch (err) {
-    console.log("[VERIFY-OTP] Catch block triggered. Rolling back...");
     await connection.rollback();
     logError("VerifyOTP", err);
-    res.status(500).json({
-      success: false,
-      message: `Verification failed: ${err instanceof Error ? err.message : String(err)}`,
-    });
+    res.status(500).json({ success: false, message: "Verification failed" });
   } finally {
     connection.release();
-    console.log("[VERIFY-OTP] Connection released.");
   }
 };
 
-/*
-LOGIN
-*/
+/* LOGIN */
 export const login = async (req: Request, res: Response) => {
-  console.log("[LOGIN] Starting login attempt...");
+  console.log("[LOGIN] Attempt started...");
   try {
     const email = normalizeEmail(req.body.email || "");
     const { password } = req.body;
-
-    console.log(`[LOGIN] email=${email}`);
 
     const [rows] = await pool.query<UserRow[]>(
       "SELECT * FROM users WHERE email=?",
       [email],
     );
+
     if (rows.length === 0) {
-      console.log("[LOGIN] User not found.");
+      console.log("[LOGIN] Email not registered.");
+      return res
+        .status(404)
+        .json({ success: false, message: "Email is not registered" });
+    }
+
+    if (!(await bcrypt.compare(password, rows[0].password))) {
+      console.log("[LOGIN] Invalid password.");
       return res
         .status(401)
         .json({ success: false, message: "Invalid credentials" });
     }
 
-    const user = rows[0];
-    console.log("[LOGIN] Comparing password...");
-    const valid = await bcrypt.compare(password, user.password);
-    if (!valid) {
-      console.log("[LOGIN] Password mismatch.");
-      return res
-        .status(401)
-        .json({ success: false, message: "Invalid credentials" });
-    }
-
-    if (user.is_verified === 0) {
-      console.log("[LOGIN] Account not verified.");
+    if (rows[0].is_verified === 0) {
+      console.log("[LOGIN] User not verified.");
       return res
         .status(403)
-        .json({ success: false, message: "Please verify your account first" });
+        .json({
+          success: false,
+          message: "Please verify your account first",
+          isVerified: false,
+        });
     }
 
-    console.log("[LOGIN] Generating token...");
-    const token = generateToken(user.id);
+    const token = generateToken(rows[0].id);
     res.cookie("token", token, {
       httpOnly: true,
-      secure: process.env.NODE_ENV === "production",
+      secure: true,
       sameSite: "strict",
-      maxAge: 7 * 24 * 60 * 60 * 1000,
+      maxAge: 604800000,
     });
 
-    console.log("[LOGIN] Login success.");
-    res.status(200).json({ success: true, message: "Login successful" });
+    console.log("[LOGIN] Success.");
+    return res
+      .status(200)
+      .json({ success: true, message: "Login successful", user: rows[0] });
   } catch (err) {
     logError("Login", err);
-    res.status(500).json({
-      success: false,
-      message: `Login error: ${err instanceof Error ? err.message : String(err)}`,
-    });
+    return res
+      .status(500)
+      .json({ success: false, message: "Internal server error" });
   }
 };
 
-/*
-FORGOT PASSWORD
-*/
+/* FORGOT PASSWORD (STEP 1) */
 export const forgotPassword = async (req: Request, res: Response) => {
-  console.log("[FORGOT-PASSWORD] Initializing...");
+  console.log("[FORGOT-PASSWORD] Password reset started...");
+  const email = normalizeEmail(req.body.email || "");
   try {
-    const email = normalizeEmail(req.body.email || "");
-    console.log(`[FORGOT-PASSWORD] email=${email}`);
-
     const [users] = await pool.query<UserRow[]>(
       "SELECT id FROM users WHERE email=?",
       [email],
     );
 
+    // REQUIREMENT: Show explicitly if not registered
     if (users.length === 0) {
-      console.log(
-        "[FORGOT-PASSWORD] User not found. Sending generic success response for security.",
-      );
+      console.log("[FORGOT-PASSWORD] Email not found.");
       return res
-        .status(200)
-        .json({ success: true, message: "If account exists, OTP sent" });
+        .status(404)
+        .json({ success: false, message: "Email is not registered" });
     }
 
-    console.log("[FORGOT-PASSWORD] Generating OTP...");
     const otp = crypto.randomInt(100000, 999999);
     const otpHash = await bcrypt.hash(String(otp), 10);
 
-    console.log("[FORGOT-PASSWORD] Storing reset OTP...");
     await pool.query(
-      `DELETE FROM otp_codes WHERE email=? AND purpose='reset_password'`,
+      "DELETE FROM otp_codes WHERE email=? AND purpose='reset_password'",
       [email],
     );
     await pool.query(
-      `INSERT INTO otp_codes (email, role, purpose, otp_hash, expires_at) VALUES (?, 'user', 'reset_password', ?, DATE_ADD(NOW(), INTERVAL 5 MINUTE))`,
+      "INSERT INTO otp_codes (email, role, purpose, otp_hash, expires_at) VALUES (?, 'user', 'reset_password', ?, DATE_ADD(NOW(), INTERVAL 5 MINUTE))",
       [email, otpHash],
     );
 
+    console.log("[FORGOT-PASSWORD] Sending OTP Email...");
     await sendOTPEmail(email, otp);
-    console.log("[FORGOT-PASSWORD] Success.");
-    res
-      .status(200)
-      .json({ success: true, message: "If account exists, OTP sent" });
+    res.status(200).json({ success: true, message: "OTP sent to your email" });
   } catch (err) {
     logError("ForgotPassword", err);
-    res.status(500).json({
-      success: false,
-      message: `Error: ${err instanceof Error ? err.message : String(err)}`,
-    });
+    res.status(500).json({ success: false, message: "Error initiating reset" });
   }
 };
 
-/*
-RESET PASSWORD
-*/
-export const resetPassword = async (req: Request, res: Response) => {
-  console.log("[RESET-PASSWORD] Starting...");
+/* VERIFY RESET OTP (STEP 2) */
+export const verifyResetOTP = async (req: Request, res: Response) => {
+  console.log("[VERIFY-RESET-OTP] Checking OTP validity...");
   const email = normalizeEmail(req.body.email || "");
-  const { otp, password: newPassword } = req.body;
+  const { otp } = req.body;
 
-  if (String(otp).length !== 6) {
-    console.log("[RESET-PASSWORD] Validation failed: OTP length");
-    return res
-      .status(400)
-      .json({ success: false, message: "Invalid OTP format" });
-  }
-
-  const connection = await pool.getConnection();
   try {
-    console.log("[RESET-PASSWORD] Starting transaction...");
-    await connection.beginTransaction();
-
-    const [rows] = await connection.query<OTPRow[]>(
-      `SELECT otp_hash FROM otp_codes WHERE email=? AND purpose='reset_password' AND expires_at > NOW() FOR UPDATE`,
+    const [rows] = await pool.query<OTPRow[]>(
+      "SELECT otp_hash FROM otp_codes WHERE email=? AND purpose='reset_password' AND expires_at > NOW()",
       [email],
     );
 
-    if (rows.length === 0) {
-      console.log("[RESET-PASSWORD] OTP expired/invalid. Rolling back...");
-      await connection.rollback();
-      return res.status(410).json({ success: false, message: "OTP expired" });
+    if (
+      rows.length === 0 ||
+      !(await bcrypt.compare(String(otp), rows[0].otp_hash))
+    ) {
+      console.log("[VERIFY-RESET-OTP] Invalid or expired OTP.");
+      return res
+        .status(401)
+        .json({ success: false, message: "Incorrect or expired OTP" });
     }
 
-    const valid = await bcrypt.compare(String(otp), rows[0].otp_hash);
-    if (!valid) {
-      console.log("[RESET-PASSWORD] OTP mismatch. Rolling back...");
-      await connection.rollback();
-      return res.status(401).json({ success: false, message: "Invalid OTP" });
-    }
+    console.log("[VERIFY-RESET-OTP] OTP Valid.");
+    res
+      .status(200)
+      .json({ success: true, message: "OTP verified successfully" });
+  } catch (err) {
+    logError("VerifyResetOTP", err);
+    res.status(500).json({ success: false, message: "Verification failed" });
+  }
+};
 
-    // --- NEW: OLD PASSWORD DETECTION START ---
-    console.log(
-      "[RESET-PASSWORD] Checking if new password matches old password...",
-    );
-    const [userRows] = await connection.query<UserRow[]>(
+/* RESET PASSWORD (STEP 3) */
+export const resetPassword = async (req: Request, res: Response) => {
+  console.log("[RESET-PASSWORD] Finalizing update...");
+  const email = normalizeEmail(req.body.email || "");
+  const { otp, password: newPassword } = req.body;
+
+  const connection = await pool.getConnection();
+  try {
+    await connection.beginTransaction();
+
+    // 1. Fetch old password to compare
+    const [users] = await connection.query<UserRow[]>(
       "SELECT password FROM users WHERE email=? FOR UPDATE",
       [email],
     );
 
-    if (userRows.length > 0) {
-      const isSamePassword = await bcrypt.compare(
-        newPassword,
-        userRows[0].password,
-      );
-      if (isSamePassword) {
-        console.log("[RESET-PASSWORD] Same password detected. Rolling back...");
-        await connection.rollback();
-        return res.status(400).json({
+    // REQUIREMENT: Check if new pass is different from old pass
+    const isSamePassword = await bcrypt.compare(newPassword, users[0].password);
+    if (isSamePassword) {
+      console.log("[RESET-PASSWORD] New password matches old password.");
+      await connection.rollback();
+      return res
+        .status(400)
+        .json({
           success: false,
-          message: "New password cannot be the same as your current password",
+          message: "New password cannot be the same as your old password",
         });
-      }
     }
-    // --- NEW: OLD PASSWORD DETECTION END ---
 
-    console.log("[RESET-PASSWORD] Hashing new password and updating user...");
+    // 2. Final OTP Verification
+    const [rows] = await connection.query<OTPRow[]>(
+      "SELECT otp_hash FROM otp_codes WHERE email=? AND purpose='reset_password' AND expires_at > NOW() FOR UPDATE",
+      [email],
+    );
+
+    if (
+      rows.length === 0 ||
+      !(await bcrypt.compare(String(otp), rows[0].otp_hash))
+    ) {
+      console.log("[RESET-PASSWORD] OTP expired or incorrect at final step.");
+      await connection.rollback();
+      return res
+        .status(401)
+        .json({ success: false, message: "Invalid or expired OTP" });
+    }
+
     const hashed = await bcrypt.hash(newPassword, 10);
-    await connection.query(`UPDATE users SET password=? WHERE email=?`, [
+    await connection.query("UPDATE users SET password=? WHERE email=?", [
       hashed,
       email,
     ]);
     await connection.query(
-      `DELETE FROM otp_codes WHERE email=? AND purpose='reset_password'`,
+      "DELETE FROM otp_codes WHERE email=? AND purpose='reset_password'",
       [email],
     );
 
-    console.log("[RESET-PASSWORD] Committing...");
     await connection.commit();
+    console.log("[RESET-PASSWORD] Password updated successfully.");
     res
       .status(200)
       .json({ success: true, message: "Password updated successfully" });
   } catch (err) {
-    console.log("[RESET-PASSWORD] Catch block triggered.");
     await connection.rollback();
     logError("ResetPassword", err);
-    res.status(500).json({
-      success: false,
-      message: `Reset failed: ${err instanceof Error ? err.message : String(err)}`,
-    });
+    res.status(500).json({ success: false, message: "Reset failed" });
   } finally {
     connection.release();
-    console.log("[RESET-PASSWORD] Connection released.");
   }
 };
-/*
-RESEND OTP
-*/
+
+/* RESEND OTP */
 export const resendOTP = async (req: Request, res: Response) => {
-  console.log("[RESEND-OTP] Initializing...");
+  console.log("[RESEND-OTP] Generating new code...");
   const { purpose } = req.body;
   const email = normalizeEmail(req.body.email || "");
-
-  const connection = await pool.getConnection();
   try {
-    console.log("[RESEND-OTP] Checking user and verification status...");
-    await connection.beginTransaction();
-
-    const [user] = await connection.query<UserRow[]>(
-      "SELECT is_verified FROM users WHERE email=? FOR UPDATE",
-      [email],
-    );
-    if (user.length === 0) {
-      console.log("[RESEND-OTP] User not found. Rolling back.");
-      await connection.rollback();
-      return res
-        .status(200)
-        .json({ success: true, message: "If account exists, new OTP sent" });
-    }
-
-    if (purpose === "register" && user[0].is_verified === 1) {
-      console.log("[RESEND-OTP] User already verified. Rolling back.");
-      await connection.rollback();
-      return res
-        .status(400)
-        .json({ success: false, message: "Account already verified" });
-    }
-
-    console.log("[RESEND-OTP] Checking rate limit...");
-    const [existingOTP] = await connection.query<RowDataPacket[]>(
-      "SELECT created_at FROM otp_codes WHERE email=? AND purpose=? AND created_at > DATE_SUB(NOW(), INTERVAL 1 MINUTE)",
-      [email, purpose],
-    );
-
-    if (existingOTP.length > 0) {
-      console.log("[RESEND-OTP] Rate limit hit. Rolling back.");
-      await connection.rollback();
-      return res
-        .status(429)
-        .json({ success: false, message: "Wait 1 minute before resending" });
-    }
-
-    console.log("[RESEND-OTP] Generating new OTP...");
     const otp = crypto.randomInt(100000, 999999);
     const otpHash = await bcrypt.hash(String(otp), 10);
 
-    await connection.query(
-      "DELETE FROM otp_codes WHERE email=? AND purpose=?",
-      [email, purpose],
-    );
-    await connection.query(
-      `INSERT INTO otp_codes (email, role, purpose, otp_hash, expires_at) VALUES (?, 'user', ?, ?, DATE_ADD(NOW(), INTERVAL 5 MINUTE))`,
+    await pool.query("DELETE FROM otp_codes WHERE email=? AND purpose=?", [
+      email,
+      purpose,
+    ]);
+    await pool.query(
+      "INSERT INTO otp_codes (email, role, purpose, otp_hash, expires_at) VALUES (?, 'user', ?, ?, DATE_ADD(NOW(), INTERVAL 5 MINUTE))",
       [email, purpose, otpHash],
     );
 
-    console.log("[RESEND-OTP] Committing and sending email...");
-    await connection.commit();
     await sendOTPEmail(email, otp);
-
     res.status(200).json({ success: true, message: "OTP resent successfully" });
   } catch (err) {
-    console.log("[RESEND-OTP] Catch block triggered.");
-    await connection.rollback();
     logError("ResendOTP", err);
-    res.status(500).json({
-      success: false,
-      message: `Resend error: ${err instanceof Error ? err.message : String(err)}`,
-    });
-  } finally {
-    connection.release();
-    console.log("[RESEND-OTP] Connection released.");
+    res.status(500).json({ success: false, message: "Resend error" });
   }
 };
 
-/*
-LOGOUT
-*/
+/* LOGOUT */
 export const logout = (req: Request, res: Response) => {
-  console.log("[LOGOUT] Clearing token cookie...");
   res.clearCookie("token", {
     httpOnly: true,
-    secure: process.env.NODE_ENV === "production",
+    secure: true,
     sameSite: "strict",
   });
-  console.log("[LOGOUT] Success.");
   res.status(200).json({ success: true, message: "Logged out" });
 };
 
+// import { Request, Response } from "express";
+// import bcrypt from "bcrypt";
+// import crypto from "crypto";
+// import { RowDataPacket, ResultSetHeader } from "mysql2";
 
+// import { pool } from "../config/db.js";
+// import { sendOTPEmail } from "../config/mailer.js";
+// import { generateToken } from "../utils/jwt.js";
 
+// /* INTERFACES */
+// interface UserRow extends RowDataPacket {
+//   id: number;
+//   name: string;
+//   email: string;
+//   password: string;
+//   mobile_no: string;
+//   is_verified: number;
+// }
 
+// interface OTPRow extends RowDataPacket {
+//   otp_hash: string;
+//   expires_at: Date;
+// }
+
+// /* UTILS */
+// const normalizeEmail = (email: string) => email.trim().toLowerCase();
+// const logError = (context: string, err: any) => {
+//   console.error(`[ERROR][${new Date().toISOString()}] ${context}:`, err);
+// };
+
+// /* GET ME (CHECK AUTH) */
+// export const getMe = async (req: Request, res: Response) => {
+//   try {
+//     const userId = (req as any).user.id;
+//     console.log(`[GET-ME] Checking auth for UserID: ${userId}`);
+
+//     const [rows] = await pool.execute<RowDataPacket[]>(
+//       "SELECT id, name, email, mobile_no FROM users WHERE id = ?",
+//       [userId],
+//     );
+
+//     if (rows.length === 0) {
+//       console.log(`[GET-ME] User ${userId} not found in database.`);
+//       return res
+//         .status(404)
+//         .json({ success: false, message: "User not found" });
+//     }
+
+//     console.log(`[GET-ME] Success! Found user: ${rows[0].email}`);
+//     res.status(200).json({ success: true, user: rows[0] });
+//   } catch (error: any) {
+//     logError("getMe", error);
+//     res.status(500).json({ success: false, message: "Server Error" });
+//   }
+// };
+
+// /* REGISTER */
+// export const register = async (req: Request, res: Response) => {
+//   console.log("[REGISTER] Process initiated...");
+//   const { name, password, mobile_no } = req.body;
+//   const email = normalizeEmail(req.body.email || "");
+
+//   const connection = await pool.getConnection();
+//   try {
+//     console.log(`[REGISTER] Validating email: ${email}`);
+//     await connection.beginTransaction();
+
+//     const [exist] = await connection.query<UserRow[]>(
+//       "SELECT id, is_verified FROM users WHERE email=? FOR UPDATE",
+//       [email],
+//     );
+
+//     if (exist.length > 0) {
+//       console.log(
+//         `[REGISTER] Email ${email} already exists. Verified status: ${exist[0].is_verified}`,
+//       );
+//       if (exist[0].is_verified === 0) {
+//         await connection.rollback();
+//         return res
+//           .status(400)
+//           .json({
+//             success: false,
+//             message:
+//               "Email is already registered but not verified. Please go to the verify page.",
+//           });
+//       }
+//       await connection.rollback();
+//       return res
+//         .status(409)
+//         .json({ success: false, message: "Email already registered" });
+//     }
+
+//     console.log("[REGISTER] Hashing password and inserting user...");
+//     const hashed = await bcrypt.hash(password, 10);
+//     await connection.query<ResultSetHeader>(
+//       "INSERT INTO users (name, email, password, mobile_no, is_verified) VALUES (?, ?, ?, ?, 0)",
+//       [name, email, hashed, mobile_no],
+//     );
+
+//     const otp = crypto.randomInt(100000, 999999);
+//     const otpHash = await bcrypt.hash(String(otp), 10);
+
+//     console.log("[REGISTER] Cleaning old OTPs and storing new code...");
+//     await connection.query(
+//       "DELETE FROM otp_codes WHERE email=? AND purpose='register'",
+//       [email],
+//     );
+//     await connection.query(
+//       "INSERT INTO otp_codes (email, role, purpose, otp_hash, expires_at) VALUES (?, 'user', 'register', ?, DATE_ADD(NOW(), INTERVAL 5 MINUTE))",
+//       [email, otpHash],
+//     );
+
+//     await connection.commit();
+//     console.log("[REGISTER] Transaction committed. Sending email...");
+//     await sendOTPEmail(email, otp);
+//     console.log("[REGISTER] Registration successful. OTP sent.");
+
+//     res
+//       .status(201)
+//       .json({ success: true, message: "Registration successful. OTP sent" });
+//   } catch (err) {
+//     await connection.rollback();
+//     logError("Register", err);
+//     res.status(500).json({ success: false, message: "Internal server error" });
+//   } finally {
+//     connection.release();
+//   }
+// };
+
+// /* VERIFY OTP */
+// export const verifyOTP = async (req: Request, res: Response) => {
+//   console.log("[VERIFY-OTP] Verification attempt started...");
+//   const email = normalizeEmail(req.body.email || "");
+//   const { otp } = req.body;
+
+//   const connection = await pool.getConnection();
+//   try {
+//     await connection.beginTransaction();
+//     console.log(`[VERIFY-OTP] Checking status for: ${email}`);
+
+//     const [userStatus] = await connection.query<UserRow[]>(
+//       "SELECT id, is_verified FROM users WHERE email=? FOR UPDATE",
+//       [email],
+//     );
+
+//     if (userStatus.length > 0 && userStatus[0].is_verified === 1) {
+//       console.log(
+//         "[VERIFY-OTP] User already verified. Handling race condition.",
+//       );
+//       const token = generateToken(userStatus[0].id);
+//       res.cookie("token", token, {
+//         httpOnly: true,
+//         secure: process.env.NODE_ENV === "production",
+//         sameSite: "strict",
+//         maxAge: 7 * 24 * 60 * 60 * 1000,
+//       });
+//       await connection.commit();
+
+//       const [user] = await pool.execute<RowDataPacket[]>(
+//         "SELECT id, name, email, mobile_no FROM users WHERE email = ?",
+//         [email],
+//       );
+//       return res
+//         .status(200)
+//         .json({
+//           success: true,
+//           message: "Account verified successfully",
+//           user: user[0],
+//         });
+//     }
+
+//     console.log("[VERIFY-OTP] Fetching OTP from DB...");
+//     const [rows] = await connection.query<OTPRow[]>(
+//       "SELECT otp_hash FROM otp_codes WHERE email=? AND purpose='register' AND expires_at > NOW() FOR UPDATE",
+//       [email],
+//     );
+
+//     if (rows.length === 0) {
+//       console.log("[VERIFY-OTP] No valid/unexpired OTP found.");
+//       await connection.rollback();
+//       return res
+//         .status(410)
+//         .json({ success: false, message: "OTP expired or not found" });
+//     }
+
+//     console.log("[VERIFY-OTP] Comparing hashes...");
+//     if (!(await bcrypt.compare(String(otp), rows[0].otp_hash))) {
+//       console.log("[VERIFY-OTP] Hash mismatch! Incorrect code.");
+//       await connection.rollback();
+//       return res.status(401).json({ success: false, message: "Incorrect OTP" });
+//     }
+
+//     console.log("[VERIFY-OTP] OTP valid. Updating user to verified.");
+//     await connection.query("UPDATE users SET is_verified=1 WHERE email=?", [
+//       email,
+//     ]);
+//     await connection.query(
+//       "DELETE FROM otp_codes WHERE email=? AND purpose='register'",
+//       [email],
+//     );
+//     await connection.commit();
+
+//     console.log("[VERIFY-OTP] Fetching final user data for frontend...");
+//     const [updatedUser] = await pool.execute<RowDataPacket[]>(
+//       "SELECT id, name, email, mobile_no FROM users WHERE email = ?",
+//       [email],
+//     );
+
+//     const token = generateToken(userStatus[0].id);
+//     res.cookie("token", token, {
+//       httpOnly: true,
+//       secure: process.env.NODE_ENV === "production",
+//       sameSite: "strict",
+//       maxAge: 7 * 24 * 60 * 60 * 1000,
+//     });
+
+//     console.log("[VERIFY-OTP] Success! User authenticated.");
+//     res
+//       .status(200)
+//       .json({
+//         success: true,
+//         message: "Account verified successfully",
+//         user: updatedUser[0],
+//       });
+//   } catch (err) {
+//     await connection.rollback();
+//     logError("VerifyOTP", err);
+//     res.status(500).json({ success: false, message: "Verification failed" });
+//   } finally {
+//     connection.release();
+//   }
+// };
+
+// /* LOGIN */
+// export const login = async (req: Request, res: Response) => {
+//   console.log("[LOGIN] 1. Login attempt started...");
+//   try {
+//     const email = normalizeEmail(req.body.email || "");
+//     const { password } = req.body;
+
+//     console.log(`[LOGIN] 2. Searching for email: ${email}`);
+//     const [rows] = await pool.query<UserRow[]>(
+//       "SELECT * FROM users WHERE email=?",
+//       [email],
+//     );
+
+//     // Check if user exists
+//     if (rows.length === 0) {
+//       console.log("[LOGIN] 2a. Fail: Email not registered.");
+//       return res
+//         .status(404)
+//         .json({ success: false, message: "Email is not registered" });
+//     }
+
+//     // Verify Password
+//     console.log("[LOGIN] 3. Verifying password...");
+//     const isMatch = await bcrypt.compare(password, rows[0].password);
+//     if (!isMatch) {
+//       console.log("[LOGIN] 3a. Fail: Password mismatch.");
+//       return res
+//         .status(401)
+//         .json({ success: false, message: "Invalid credentials" });
+//     }
+
+//     // Check Verification Status
+//     console.log(`[LOGIN] 4. Checking verification status for user ID: ${rows[0].id}`);
+//     if (rows[0].is_verified === 0) {
+//       console.log("[LOGIN] 4a. Redirect Trigger: User exists but is not verified.");
+//       return res.status(403).json({
+//         success: false,
+//         message: "Please verify your account first",
+//         isVerified: false // Flag for frontend logic
+//       });
+//     }
+
+//     // Generate Token
+//     console.log("[LOGIN] 5. Authentication successful. Generating token...");
+//     const token = generateToken(rows[0].id);
+
+//     res.cookie("token", token, {
+//       httpOnly: true,
+//       secure: process.env.NODE_ENV === "production",
+//       sameSite: "strict",
+//       maxAge: 7 * 24 * 60 * 60 * 1000,
+//     });
+
+//     console.log("[LOGIN] 6. Login successful. Token set in cookie.");
+//     return res.status(200).json({
+//       success: true,
+//       message: "Login successful",
+//       user: { id: rows[0].id, email: rows[0].email, name: rows[0].name }
+//     });
+
+//   } catch (err) {
+//     console.error("[LOGIN] CRITICAL ERROR:", err);
+//     logError("Login", err);
+//     return res.status(500).json({ success: false, message: "Internal server error during login" });
+//   }
+// };
+
+// /* FORGOT & RESET PASSWORD */
+// export const forgotPassword = async (req: Request, res: Response) => {
+//   console.log("[FORGOT-PASSWORD] Password reset initiated...");
+//   const email = normalizeEmail(req.body.email || "");
+//   try {
+//     const [users] = await pool.query<UserRow[]>(
+//       "SELECT id FROM users WHERE email=?",
+//       [email],
+//     );
+//     if (users.length === 0) {
+//       console.log(
+//         "[FORGOT-PASSWORD] Email not found. Sending generic success.",
+//       );
+//       return res
+//         .status(200)
+//         .json({ success: true, message: "If account exists, OTP sent" });
+//     }
+
+//     console.log("[FORGOT-PASSWORD] Generating reset OTP...");
+//     const otp = crypto.randomInt(100000, 999999);
+//     const otpHash = await bcrypt.hash(String(otp), 10);
+
+//     await pool.query(
+//       "DELETE FROM otp_codes WHERE email=? AND purpose='reset_password'",
+//       [email],
+//     );
+//     await pool.query(
+//       "INSERT INTO otp_codes (email, role, purpose, otp_hash, expires_at) VALUES (?, 'user', 'reset_password', ?, DATE_ADD(NOW(), INTERVAL 5 MINUTE))",
+//       [email, otpHash],
+//     );
+
+//     await sendOTPEmail(email, otp);
+//     console.log("[FORGOT-PASSWORD] OTP sent successfully.");
+//     res.status(200).json({ success: true, message: "OTP sent to your email" });
+//   } catch (err) {
+//     logError("ForgotPassword", err);
+//     res.status(500).json({ success: false, message: "Error initiating reset" });
+//   }
+// };
+
+// /* RESEND OTP & LOGOUT */
+// export const resendOTP = async (req: Request, res: Response) => {
+//   console.log("[RESEND-OTP] Request received.");
+//   const { purpose } = req.body;
+//   const email = normalizeEmail(req.body.email || "");
+//   try {
+//     console.log(`[RESEND-OTP] Generating new ${purpose} OTP for ${email}`);
+//     const otp = crypto.randomInt(100000, 999999);
+//     const otpHash = await bcrypt.hash(String(otp), 10);
+
+//     await pool.query("DELETE FROM otp_codes WHERE email=? AND purpose=?", [
+//       email,
+//       purpose,
+//     ]);
+//     await pool.query(
+//       "INSERT INTO otp_codes (email, role, purpose, otp_hash, expires_at) VALUES (?, 'user', ?, ?, DATE_ADD(NOW(), INTERVAL 5 MINUTE))",
+//       [email, purpose, otpHash],
+//     );
+
+//     await sendOTPEmail(email, otp);
+//     console.log("[RESEND-OTP] Success.");
+//     res.status(200).json({ success: true, message: "OTP resent successfully" });
+//   } catch (err) {
+//     logError("ResendOTP", err);
+//     res.status(500).json({ success: false, message: "Resend error" });
+//   }
+// };
+
+// export const logout = (req: Request, res: Response) => {
+//   console.log("[LOGOUT] Clearing token cookie.");
+//   res.clearCookie("token", {
+//     httpOnly: true,
+//     secure: process.env.NODE_ENV === "production",
+//     sameSite: "strict",
+//   });
+//   res.status(200).json({ success: true, message: "Logged out" });
+// };
+
+// /* RESET-PASSWORD CONTROLLER */
+// export const resetPassword = async (req: Request, res: Response) => {
+//   console.log("[RESET-PASSWORD] 1. Password reset process started...");
+//   const email = normalizeEmail(req.body.email || "");
+//   const { otp, password: newPassword } = req.body;
+
+//   const connection = await pool.getConnection();
+//   try {
+//     await connection.beginTransaction();
+//     console.log(`[RESET-PASSWORD] 2. Verifying OTP for: ${email}`);
+
+//     // Fetch and Lock the OTP record
+//     const [rows] = await connection.query<OTPRow[]>(
+//       "SELECT otp_hash FROM otp_codes WHERE email=? AND purpose='reset_password' AND expires_at > NOW() FOR UPDATE",
+//       [email],
+//     );
+
+//     // Verify OTP exists and matches
+//     if (
+//       rows.length === 0 ||
+//       !(await bcrypt.compare(String(otp), rows[0].otp_hash))
+//     ) {
+//       console.log("[RESET-PASSWORD] 2a. Fail: Invalid or expired OTP.");
+//       await connection.rollback();
+//       return res
+//         .status(401)
+//         .json({ success: false, message: "Invalid or expired OTP" });
+//     }
+
+//     // Hash the new password
+//     console.log("[RESET-PASSWORD] 3. OTP verified. Hashing new password...");
+//     const hashed = await bcrypt.hash(newPassword, 10);
+
+//     // Update the user's password first
+//     console.log("[RESET-PASSWORD] 4. Updating user password in database...");
+//     const [updateResult] = await connection.query<ResultSetHeader>(
+//       "UPDATE users SET password=? WHERE email=?",
+//       [hashed, email]
+//     );
+
+//     if (updateResult.affectedRows === 0) {
+//       throw new Error("User record not found during password update");
+//     }
+
+//     // Delete the OTP only after the password has been successfully updated
+//     console.log("[RESET-PASSWORD] 5. Password updated. Cleaning up used OTP...");
+//     await connection.query(
+//       "DELETE FROM otp_codes WHERE email=? AND purpose='reset_password'",
+//       [email],
+//     );
+
+//     await connection.commit();
+//     console.log("[RESET-PASSWORD] 6. Success! Reset complete.");
+
+//     return res
+//       .status(200)
+//       .json({ success: true, message: "Password updated successfully" });
+
+//   } catch (err) {
+//     await connection.rollback();
+//     logError("ResetPassword", err);
+//     return res.status(500).json({ success: false, message: "Reset failed. Please try again." });
+//   } finally {
+//     connection.release();
+//   }
+// };
+
+// export const resetPassword = async (req: Request, res: Response) => {
+//   console.log("[RESET-PASSWORD] Updating password...");
+//   const email = normalizeEmail(req.body.email || "");
+//   const { otp, password: newPassword } = req.body;
+//   const connection = await pool.getConnection();
+//   try {
+//     await connection.beginTransaction();
+//     console.log(`[RESET-PASSWORD] Verifying OTP for ${email}`);
+
+//     const [rows] = await connection.query<OTPRow[]>(
+//       "SELECT otp_hash FROM otp_codes WHERE email=? AND purpose='reset_password' AND expires_at > NOW() FOR UPDATE",
+//       [email],
+//     );
+
+//     if (
+//       rows.length === 0 ||
+//       !(await bcrypt.compare(String(otp), rows[0].otp_hash))
+//     ) {
+//       console.log("[RESET-PASSWORD] Invalid or expired OTP.");
+//       await connection.rollback();
+//       return res
+//         .status(401)
+//         .json({ success: false, message: "Invalid or expired OTP" });
+//     }
+
+//     console.log("[RESET-PASSWORD] Hashing new password...");
+//     const hashed = await bcrypt.hash(newPassword, 10);
+//     await connection.query("UPDATE users SET password=? WHERE email=?", [
+//       hashed,
+//       email,
+//     ]);
+//     await connection.query(
+//       "DELETE FROM otp_codes WHERE email=? AND purpose='reset_password'",
+//       [email],
+//     );
+
+//     await connection.commit();
+//     console.log("[RESET-PASSWORD] Success! Password updated.");
+//     res
+//       .status(200)
+//       .json({ success: true, message: "Password updated successfully" });
+//   } catch (err) {
+//     await connection.rollback();
+//     logError("ResetPassword", err);
+//     res.status(500).json({ success: false, message: "Reset failed" });
+//   } finally {
+//     connection.release();
+//   }
+// };
+
+//  export const login = async (req: Request, res: Response) => {
+//    console.log("[LOGIN] Login attempt started...");
+//    try {
+//      const email = normalizeEmail(req.body.email || "");
+//      const { password } = req.body;
+
+//      console.log(`[LOGIN] Searching for email: ${email}`);
+//      const [rows] = await pool.query<UserRow[]>(
+//        "SELECT * FROM users WHERE email=?",
+//        [email],
+//      );
+
+//      if (rows.length === 0) {
+//        console.log("[LOGIN] Email not registered.");
+//        return res
+//          .status(404)
+//          .json({ success: false, message: "Email is not registered" });
+//      }
+
+//      console.log("[LOGIN] Verifying password...");
+//      if (!(await bcrypt.compare(password, rows[0].password))) {
+//        console.log("[LOGIN] Password mismatch.");
+//        return res
+//          .status(401)
+//          .json({ success: false, message: "Invalid credentials" });
+//      }
+
+//      if (rows[0].is_verified === 0) {
+//        console.log("[LOGIN] User exists but is not verified.");
+//        return res
+//          .status(403)
+//          .json({ success: false, message: "Please verify your account first" });
+//      }
+
+//      console.log("[LOGIN] Authentication successful. Generating token...");
+//      const token = generateToken(rows[0].id);
+//      res.cookie("token", token, {
+//        httpOnly: true,
+//        secure: process.env.NODE_ENV === "production",
+//        sameSite: "strict",
+//        maxAge: 7 * 24 * 60 * 60 * 1000,
+//      });
+
+//      res
+//        .status(200)
+//        .json({ success: true, message: "Login successful", user: rows[0] });
+//      console.log("[LOGIN] Login successful. Token set in cookie.");
+//    } catch (err) {
+//      logError("Login", err);
+//      res.status(500).json({ success: false, message: "Login error" });
+//    }
+//  };
+
+// import { Request, Response } from "express";
+// import bcrypt from "bcrypt";
+// import crypto from "crypto";
+// import { RowDataPacket, ResultSetHeader } from "mysql2";
+
+// import { pool } from "../config/db.js";
+// import { sendOTPEmail } from "../config/mailer.js";
+// import { generateToken } from "../utils/jwt.js";
+
+// /*
+// INTERFACES
+// */
+// interface UserRow extends RowDataPacket {
+//   id: number;
+//   name: string;
+//   email: string;
+//   password: string;
+//   mobile_no: string;
+//   is_verified: number;
+// }
+
+// interface OTPRow extends RowDataPacket {
+//   otp_hash: string;
+//   expires_at: Date;
+// }
+
+// /*
+// UTILS
+// */
+// const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+// const normalizeEmail = (email: string) => email.trim().toLowerCase();
+
+// const logError = (context: string, err: any) => {
+//   console.error(`[ERROR][${new Date().toISOString()}] ${context}:`, err);
+// };
+
+// /*
+// GET ME (CHECK AUTH)
+// */
+// export const getMe = async (req: Request, res: Response) => {
+//   try {
+//     const userId = (req as any).user.id;
+//     console.log(`[GET-ME] Checking auth for UserID: ${userId}`);
+
+//     const [rows] = await pool.execute<RowDataPacket[]>(
+//       "SELECT id, name, email, mobile_no FROM users WHERE id = ?",
+//       [userId],
+//     );
+
+//     if (rows.length === 0) {
+//       console.log(`[GET-ME] User not found in DB.`);
+//       return res
+//         .status(404)
+//         .json({ success: false, message: "User not found" });
+//     }
+
+//     console.log(`[GET-ME] Success: ${rows[0].email}`);
+//     res.status(200).json({ success: true, user: rows[0] });
+//   } catch (error: any) {
+//     logError("getMe", error);
+//     res.status(500).json({ success: false, message: "Server Error" });
+//   }
+// };
+
+// /*
+// REGISTER
+// */
+// export const register = async (req: Request, res: Response) => {
+//   console.log("[REGISTER] Starting...");
+//   const { name, password, mobile_no } = req.body;
+//   const email = normalizeEmail(req.body.email || "");
+
+//   if (!name || !email || !password || !mobile_no) {
+//     return res
+//       .status(400)
+//       .json({ success: false, message: "All fields required" });
+//   }
+
+//   const connection = await pool.getConnection();
+//   try {
+//     await connection.beginTransaction();
+//     const [exist] = await connection.query<UserRow[]>(
+//       "SELECT id, is_verified FROM users WHERE email=? FOR UPDATE",
+//       [email],
+//     );
+
+//     if (exist.length > 0) {
+//       if (exist[0].is_verified === 0) {
+//         console.log("[REGISTER] Unverified user found. Redirecting to OTP.");
+//         await connection.rollback();
+//         return res.status(400).json({
+//           success: false,
+//           message:
+//             "Email is already registered but not verified. Please go to the verify page.",
+//         });
+//       }
+//       console.log("[REGISTER] Verified user found. Blocking.");
+//       await connection.rollback();
+//       return res
+//         .status(409)
+//         .json({ success: false, message: "Email already registered" });
+//     }
+
+//     const hashed = await bcrypt.hash(password, 10);
+//     await connection.query<ResultSetHeader>(
+//       "INSERT INTO users (name, email, password, mobile_no, is_verified) VALUES (?, ?, ?, ?, 0)",
+//       [name, email, hashed, mobile_no],
+//     );
+
+//     const otp = crypto.randomInt(100000, 999999);
+//     const otpHash = await bcrypt.hash(String(otp), 10);
+
+//     await connection.query(
+//       "DELETE FROM otp_codes WHERE email=? AND purpose='register'",
+//       [email],
+//     );
+//     await connection.query(
+//       "INSERT INTO otp_codes (email, role, purpose, otp_hash, expires_at) VALUES (?, 'user', 'register', ?, DATE_ADD(NOW(), INTERVAL 5 MINUTE))",
+//       [email, otpHash],
+//     );
+
+//     await connection.commit();
+//     await sendOTPEmail(email, otp);
+//     console.log("[REGISTER] Success. OTP sent.");
+//     res
+//       .status(201)
+//       .json({ success: true, message: "Registration successful. OTP sent" });
+//   } catch (err) {
+//     await connection.rollback();
+//     logError("Register", err);
+//     res.status(500).json({ success: false, message: "Internal server error" });
+//   } finally {
+//     connection.release();
+//   }
+// };
+
+// /*
+// VERIFY OTP
+// */
+// export const verifyOTP = async (req: Request, res: Response) => {
+//   console.log("[VERIFY-OTP] Starting...");
+//   const email = normalizeEmail(req.body.email || "");
+//   const { otp } = req.body;
+
+//   const connection = await pool.getConnection();
+//   try {
+//     await connection.beginTransaction();
+
+//     // Race condition check: Is user already verified?
+//     const [userStatus] = await connection.query<UserRow[]>(
+//       "SELECT id, is_verified FROM users WHERE email=? FOR UPDATE",
+//       [email],
+//     );
+
+//     if (userStatus.length > 0 && userStatus[0].is_verified === 1) {
+//       console.log(
+//         "[VERIFY-OTP] User already verified (Race condition handled).",
+//       );
+//       const token = generateToken(userStatus[0].id);
+//       res.cookie("token", token, {
+//         httpOnly: true,
+//         secure: process.env.NODE_ENV === "production",
+//         sameSite: "strict",
+//         maxAge: 7 * 24 * 60 * 60 * 1000,
+//       });
+//       await connection.commit();
+//       return res
+//         .status(200)
+//         .json({ success: true, message: "Account verified successfully" });
+//     }
+
+//     const [rows] = await connection.query<OTPRow[]>(
+//       "SELECT otp_hash FROM otp_codes WHERE email=? AND purpose='register' AND expires_at > NOW() FOR UPDATE",
+//       [email],
+//     );
+
+//     if (rows.length === 0) {
+//       console.log("[VERIFY-OTP] No valid OTP found.");
+//       await connection.rollback();
+//       return res
+//         .status(410)
+//         .json({ success: false, message: "OTP expired or not found" });
+//     }
+
+//     const valid = await bcrypt.compare(String(otp), rows[0].otp_hash);
+//     if (!valid) {
+//       console.log("[VERIFY-OTP] Hash mismatch.");
+//       await connection.rollback();
+//       return res.status(401).json({ success: false, message: "Incorrect OTP" });
+//     }
+
+//     await connection.query("UPDATE users SET is_verified=1 WHERE email=?", [
+//       email,
+//     ]);
+//     await connection.query(
+//       "DELETE FROM otp_codes WHERE email=? AND purpose='register'",
+//       [email],
+//     );
+
+//     await connection.commit();
+//     const token = generateToken(userStatus[0].id);
+//     res.cookie("token", token, {
+//       httpOnly: true,
+//       secure: process.env.NODE_ENV === "production",
+//       sameSite: "strict",
+//       maxAge: 7 * 24 * 60 * 60 * 1000,
+//     });
+//     console.log("[VERIFY-OTP] Success.");
+//     res
+//       .status(200)
+//       .json({ success: true, message: "Account verified successfully" });
+//   } catch (err) {
+//     await connection.rollback();
+//     logError("VerifyOTP", err);
+//     res.status(500).json({ success: false, message: "Verification failed" });
+//   } finally {
+//     connection.release();
+//   }
+// };
+
+// /*
+// LOGIN
+// */
+// export const login = async (req: Request, res: Response) => {
+//   console.log("[LOGIN] Attempting...");
+//   try {
+//     const email = normalizeEmail(req.body.email || "");
+//     const { password } = req.body;
+
+//     const [rows] = await pool.query<UserRow[]>(
+//       "SELECT * FROM users WHERE email=?",
+//       [email],
+//     );
+//     if (rows.length === 0) {
+//       console.log("[LOGIN] Email not found.");
+//       return res
+//         .status(404)
+//         .json({ success: false, message: "Email is not registered" });
+//     }
+
+//     const user = rows[0];
+//     const valid = await bcrypt.compare(password, user.password);
+//     if (!valid)
+//       return res
+//         .status(401)
+//         .json({ success: false, message: "Invalid credentials" });
+
+//     if (user.is_verified === 0)
+//       return res
+//         .status(403)
+//         .json({ success: false, message: "Please verify your account first" });
+
+//     const token = generateToken(user.id);
+//     res.cookie("token", token, {
+//       httpOnly: true,
+//       secure: process.env.NODE_ENV === "production",
+//       sameSite: "strict",
+//       maxAge: 7 * 24 * 60 * 60 * 1000,
+//     });
+//     console.log("[LOGIN] Success.");
+//     res.status(200).json({ success: true, message: "Login successful" });
+//   } catch (err) {
+//     logError("Login", err);
+//     res.status(500).json({ success: false, message: "Login error" });
+//   }
+// };
+
+// /*
+// FORGOT PASSWORD
+// */
+// export const forgotPassword = async (req: Request, res: Response) => {
+//   console.log("[FORGOT-PASSWORD] Initializing...");
+//   try {
+//     const email = normalizeEmail(req.body.email || "");
+//     console.log(`[FORGOT-PASSWORD] Target: ${email}`);
+
+//     const [users] = await pool.query<UserRow[]>(
+//       "SELECT id FROM users WHERE email=?",
+//       [email],
+//     );
+
+//     if (users.length === 0) {
+//       console.log(
+//         "[FORGOT-PASSWORD] Email not in DB. Sending generic success.",
+//       );
+//       return res
+//         .status(200)
+//         .json({ success: true, message: "If account exists, OTP sent" });
+//     }
+
+//     const otp = crypto.randomInt(100000, 999999);
+//     const otpHash = await bcrypt.hash(String(otp), 10);
+
+//     console.log("[FORGOT-PASSWORD] Storing reset OTP...");
+//     await pool.query(
+//       "DELETE FROM otp_codes WHERE email=? AND purpose='reset_password'",
+//       [email],
+//     );
+//     await pool.query(
+//       "INSERT INTO otp_codes (email, role, purpose, otp_hash, expires_at) VALUES (?, 'user', 'reset_password', ?, DATE_ADD(NOW(), INTERVAL 5 MINUTE))",
+//       [email, otpHash],
+//     );
+
+//     await sendOTPEmail(email, otp);
+//     console.log("[FORGOT-PASSWORD] Email sent.");
+//     res.status(200).json({ success: true, message: "OTP sent to your email" });
+//   } catch (err) {
+//     logError("ForgotPassword", err);
+//     res.status(500).json({ success: false, message: "Error initiating reset" });
+//   }
+// };
+
+// /*
+// RESET PASSWORD
+// */
+// export const resetPassword = async (req: Request, res: Response) => {
+//   console.log("[RESET-PASSWORD] Starting update...");
+//   const email = normalizeEmail(req.body.email || "");
+//   const { otp, password: newPassword } = req.body;
+
+//   const connection = await pool.getConnection();
+//   try {
+//     await connection.beginTransaction();
+//     const [rows] = await connection.query<OTPRow[]>(
+//       "SELECT otp_hash FROM otp_codes WHERE email=? AND purpose='reset_password' AND expires_at > NOW() FOR UPDATE",
+//       [email],
+//     );
+
+//     if (rows.length === 0) {
+//       console.log("[RESET-PASSWORD] OTP expired/invalid.");
+//       await connection.rollback();
+//       return res.status(410).json({ success: false, message: "OTP expired" });
+//     }
+
+//     const valid = await bcrypt.compare(String(otp), rows[0].otp_hash);
+//     if (!valid) {
+//       console.log("[RESET-PASSWORD] OTP hash mismatch.");
+//       await connection.rollback();
+//       return res.status(401).json({ success: false, message: "Invalid OTP" });
+//     }
+
+//     // Check if same as old password
+//     const [userRows] = await connection.query<UserRow[]>(
+//       "SELECT password FROM users WHERE email=? FOR UPDATE",
+//       [email],
+//     );
+//     if (userRows.length > 0) {
+//       const isSame = await bcrypt.compare(newPassword, userRows[0].password);
+//       if (isSame) {
+//         console.log("[RESET-PASSWORD] New password matches old password.");
+//         await connection.rollback();
+//         return res
+//           .status(400)
+//           .json({
+//             success: false,
+//             message: "New password cannot be the same as old one",
+//           });
+//       }
+//     }
+
+//     const hashed = await bcrypt.hash(newPassword, 10);
+//     await connection.query("UPDATE users SET password=? WHERE email=?", [
+//       hashed,
+//       email,
+//     ]);
+//     await connection.query(
+//       "DELETE FROM otp_codes WHERE email=? AND purpose='reset_password'",
+//       [email],
+//     );
+
+//     await connection.commit();
+//     console.log("[RESET-PASSWORD] Success.");
+//     res
+//       .status(200)
+//       .json({ success: true, message: "Password updated successfully" });
+//   } catch (err) {
+//     await connection.rollback();
+//     logError("ResetPassword", err);
+//     res.status(500).json({ success: false, message: "Reset failed" });
+//   } finally {
+//     connection.release();
+//   }
+// };
+
+// /*
+// RESEND OTP
+// */
+// export const resendOTP = async (req: Request, res: Response) => {
+//   console.log("[RESEND-OTP] Initializing...");
+//   const { purpose } = req.body;
+//   const email = normalizeEmail(req.body.email || "");
+
+//   const connection = await pool.getConnection();
+//   try {
+//     await connection.beginTransaction();
+//     const [user] = await connection.query<UserRow[]>(
+//       "SELECT is_verified FROM users WHERE email=? FOR UPDATE",
+//       [email],
+//     );
+//     if (user.length === 0) {
+//       await connection.rollback();
+//       return res
+//         .status(200)
+//         .json({ success: true, message: "If account exists, new OTP sent" });
+//     }
+
+//     const [existingOTP] = await connection.query<RowDataPacket[]>(
+//       "SELECT created_at FROM otp_codes WHERE email=? AND purpose=? AND created_at > DATE_SUB(NOW(), INTERVAL 1 MINUTE)",
+//       [email, purpose],
+//     );
+//     if (existingOTP.length > 0) {
+//       await connection.rollback();
+//       return res
+//         .status(429)
+//         .json({ success: false, message: "Wait 1 minute before resending" });
+//     }
+
+//     const otp = crypto.randomInt(100000, 999999);
+//     const otpHash = await bcrypt.hash(String(otp), 10);
+
+//     await connection.query(
+//       "DELETE FROM otp_codes WHERE email=? AND purpose=?",
+//       [email, purpose],
+//     );
+//     await connection.query(
+//       "INSERT INTO otp_codes (email, role, purpose, otp_hash, expires_at) VALUES (?, 'user', ?, ?, DATE_ADD(NOW(), INTERVAL 5 MINUTE))",
+//       [email, purpose, otpHash],
+//     );
+
+//     await connection.commit();
+//     await sendOTPEmail(email, otp);
+//     console.log("[RESEND-OTP] Success.");
+//     res.status(200).json({ success: true, message: "OTP resent successfully" });
+//   } catch (err) {
+//     await connection.rollback();
+//     logError("ResendOTP", err);
+//     res.status(500).json({ success: false, message: "Resend error" });
+//   } finally {
+//     connection.release();
+//   }
+// };
+
+// /*
+// LOGOUT
+// */
+// export const logout = (req: Request, res: Response) => {
+//   console.log("[LOGOUT] Clearing cookie.");
+//   res.clearCookie("token", {
+//     httpOnly: true,
+//     secure: process.env.NODE_ENV === "production",
+//     sameSite: "strict",
+//   });
+//   res.status(200).json({ success: true, message: "Logged out" });
+// };
+
+// import { Request, Response } from "express";
+// import bcrypt from "bcrypt";
+// import crypto from "crypto";
+// import { RowDataPacket, ResultSetHeader } from "mysql2";
+
+// import { pool } from "../config/db.js";
+// import { sendOTPEmail } from "../config/mailer.js";
+// import { generateToken } from "../utils/jwt.js";
+
+// // export const getMe = async (req: Request, res: Response) => {
+// //   try {
+// //     // 1. Get the user ID attached by your authMiddleware
+// //     const userId = (req as any).user.id;
+
+// //     // 2. Fetch user details from MySQL (excluding password for security)
+// //     // We use RowDataPacket[] to tell TypeScript what the database returns
+// //     const [rows] = await pool.execute<RowDataPacket[]>(
+// //       "SELECT id, name, email, mobile_no, FROM users WHERE id = ?",
+// //       [userId],
+// //     );
+
+// //     // 3. Check if user exists
+// //     if (rows.length === 0) {
+// //       return res.status(404).json({
+// //         success: false,
+// //         message: "User not found",
+// //       });
+// //     }
+
+// //     // 4. Return user data to the frontend
+// //     res.status(200).json({
+// //       success: true,
+// //       user: rows[0],
+// //     });
+// //   } catch (error: any) {
+// //     console.error("Error in getMe:", error.message);
+// //     res.status(500).json({
+// //       success: false,
+// //       message: "Server Error while fetching user data",
+// //     });
+// //   }
+// // };
+
+// /*
+// GET CURRENT USER (CHECK AUTH)
+// */
+
+// /*
+// INTERFACES
+// */
+// interface UserRow extends RowDataPacket {
+//   id: number;
+//   name: string;
+//   email: string;
+//   password: string;
+//   mobile_no: string;
+//   is_verified: number;
+// }
+
+// interface OTPRow extends RowDataPacket {
+//   otp_hash: string;
+//   expires_at: Date;
+// }
+
+// /*
+// REGEX & UTILS
+// */
+// const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+// const passwordRegex = /^(?=.*[A-Za-z])(?=.*\d)[A-Za-z\d]{8,}$/;
+// const mobileRegex = /^[0-9]{10}$/;
+
+// const normalizeEmail = (email: string) => email.trim().toLowerCase();
+
+// const logError = (context: string, err: any) => {
+//   console.error(`[ERROR][${new Date().toISOString()}] ${context}:`, err);
+// };
+
+// export const getMe = async (req: Request, res: Response) => {
+//   try {
+//     // 1. Get the user ID attached by your authMiddleware
+//     // Ensure your authMiddleware sets req.user.id
+//     const userId = (req as any).user.id;
+
+//     // 2. Fetch user details from MySQL (excluding password for security)
+//     // FIX: Removed the trailing comma after mobile_no
+//     const [rows] = await pool.execute<RowDataPacket[]>(
+//       "SELECT id, name, email, mobile_no FROM users WHERE id = ?",
+//       [userId],
+//     );
+
+//     // 3. Check if user exists
+//     if (rows.length === 0) {
+//       console.log(`[GET-ME] User with ID ${userId} not found.`);
+//       return res.status(404).json({
+//         success: false,
+//         message: "User not found",
+//       });
+//     }
+
+//     // 4. Return user data to the frontend
+//     console.log(`[GET-ME] User found: ${rows[0].email}`);
+//     res.status(200).json({
+//       success: true,
+//       user: rows[0],
+//     });
+//   } catch (error: any) {
+//     logError("getMe", error);
+//     res.status(500).json({
+//       success: false,
+//       message: "Server Error while fetching user data",
+//     });
+//   }
+// };
+
+// export const register = async (req: Request, res: Response) => {
+//   const { name, password, mobile_no } = req.body;
+//   const email = normalizeEmail(req.body.email || "");
+
+//   if (!name || !email || !password || !mobile_no) {
+//     return res
+//       .status(400)
+//       .json({ success: false, message: "All fields required" });
+//   }
+
+//   const connection = await pool.getConnection();
+//   try {
+//     await connection.beginTransaction();
+
+//     const [exist] = await connection.query<UserRow[]>(
+//       "SELECT id, is_verified FROM users WHERE email=? FOR UPDATE",
+//       [email],
+//     );
+
+//     if (exist.length > 0) {
+//       const existingUser = exist[0];
+
+//       // If user exists but is NOT verified
+//       if (existingUser.is_verified === 0) {
+//         await connection.rollback();
+//         // Return 400 so Redux triggers the 'rejected' case with this message
+//         return res.status(400).json({
+//           success: false,
+//           message:
+//             "Email is already registered but not verified. Please go to the verify page.",
+//         });
+//       }
+
+//       await connection.rollback();
+//       return res
+//         .status(409)
+//         .json({ success: false, message: "Email already registered" });
+//     }
+
+//     const hashed = await bcrypt.hash(password, 10);
+//     await connection.query<ResultSetHeader>(
+//       `INSERT INTO users (name, email, password, mobile_no, is_verified) VALUES (?, ?, ?, ?, 0)`,
+//       [name, email, hashed, mobile_no],
+//     );
+
+//     const otp = crypto.randomInt(100000, 999999);
+//     const otpHash = await bcrypt.hash(String(otp), 10);
+
+//     await connection.query(
+//       `DELETE FROM otp_codes WHERE email=? AND purpose='register'`,
+//       [email],
+//     );
+//     await connection.query(
+//       `INSERT INTO otp_codes (email, role, purpose, otp_hash, expires_at) VALUES (?, 'user', 'register', ?, DATE_ADD(NOW(), INTERVAL 5 MINUTE))`,
+//       [email, otpHash],
+//     );
+
+//     await connection.commit();
+//     await sendOTPEmail(email, otp);
+
+//     return res
+//       .status(201)
+//       .json({ success: true, message: "Registration successful. OTP sent" });
+//   } catch (err) {
+//     await connection.rollback();
+//     logError("Register", err);
+//     return res
+//       .status(500)
+//       .json({ success: false, message: "Internal server error" });
+//   } finally {
+//     connection.release();
+//   }
+// };
+
+// /*
+// VERIFY OTP
+// */
+// export const verifyOTP = async (req: Request, res: Response) => {
+//   console.log("[VERIFY-OTP] Starting verification...");
+//   const email = normalizeEmail(req.body.email || "");
+//   const { otp } = req.body;
+
+//   if (!otp || String(otp).length !== 6) {
+//     console.log("[VERIFY-OTP] Validation failed: Invalid OTP length");
+//     return res
+//       .status(400)
+//       .json({ success: false, message: "Invalid OTP length" });
+//   }
+
+//   const connection = await pool.getConnection();
+//   try {
+//     console.log("[VERIFY-OTP] Connection acquired. Starting transaction...");
+//     await connection.beginTransaction();
+
+//     console.log("[VERIFY-OTP] Fetching OTP from database...");
+//     const [rows] = await connection.query<OTPRow[]>(
+//       `SELECT otp_hash FROM otp_codes WHERE email=? AND purpose='register' AND expires_at > NOW() FOR UPDATE`,
+//       [email],
+//     );
+
+//     if (rows.length === 0) {
+//       console.log("[VERIFY-OTP] No valid/unexpired OTP found. Rolling back...");
+//       await connection.rollback();
+//       return res
+//         .status(410)
+//         .json({ success: false, message: "OTP expired or not found" });
+//     }
+
+//     console.log("[VERIFY-OTP] Comparing OTP hash...");
+//     const valid = await bcrypt.compare(String(otp), rows[0].otp_hash);
+//     if (!valid) {
+//       console.log("[VERIFY-OTP] OTP mismatch. Rolling back...");
+//       await connection.rollback();
+//       return res.status(401).json({ success: false, message: "Incorrect OTP" });
+//     }
+
+//     console.log(
+//       "[VERIFY-OTP] OTP valid. Updating user status and deleting code...",
+//     );
+//     await connection.query(`UPDATE users SET is_verified=1 WHERE email=?`, [
+//       email,
+//     ]);
+//     await connection.query(
+//       `DELETE FROM otp_codes WHERE email=? AND purpose='register'`,
+//       [email],
+//     );
+
+//     const [userRows] = await connection.query<UserRow[]>(
+//       "SELECT id FROM users WHERE email=?",
+//       [email],
+//     );
+
+//     console.log("[VERIFY-OTP] Committing transaction...");
+//     await connection.commit();
+
+//     console.log("[VERIFY-OTP] Generating JWT and setting cookie...");
+//     const token = generateToken(userRows[0].id);
+//     res.cookie("token", token, {
+//       httpOnly: true,
+//       secure: process.env.NODE_ENV === "production",
+//       sameSite: "strict",
+//       maxAge: 7 * 24 * 60 * 60 * 1000,
+//     });
+
+//     console.log("[VERIFY-OTP] Verification success.");
+//     res
+//       .status(200)
+//       .json({ success: true, message: "Account verified successfully" });
+//   } catch (err) {
+//     console.log("[VERIFY-OTP] Catch block triggered. Rolling back...");
+//     await connection.rollback();
+//     logError("VerifyOTP", err);
+//     res.status(500).json({
+//       success: false,
+//       message: `Verification failed: ${err instanceof Error ? err.message : String(err)}`,
+//     });
+//   } finally {
+//     connection.release();
+//     console.log("[VERIFY-OTP] Connection released.");
+//   }
+// };
+
+// /*
+// LOGIN
+// */
+// export const login = async (req: Request, res: Response) => {
+//   console.log("[LOGIN] Starting login attempt...");
+//   try {
+//     const email = normalizeEmail(req.body.email || "");
+//     const { password } = req.body;
+
+//     console.log(`[LOGIN] email=${email}`);
+
+//     const [rows] = await pool.query<UserRow[]>(
+//       "SELECT * FROM users WHERE email=?",
+//       [email],
+//     );
+//     // if (rows.length === 0) {
+//     //   console.log("[LOGIN] User not found.");
+//     //   return res
+//     //     .status(401)
+//     //     .json({ success: false, message: "Invalid credentials" });
+//     // }
+//     if (rows.length === 0) {
+//       console.log("[LOGIN] User not found.");
+//       return res
+//         .status(404) // Using 404 is more accurate for "Not Found"
+//         .json({ success: false, message: "Email is not registered" });
+//     }
+
+//     const user = rows[0];
+//     console.log("[LOGIN] Comparing password...");
+//     const valid = await bcrypt.compare(password, user.password);
+//     if (!valid) {
+//       console.log("[LOGIN] Password mismatch.");
+//       return res
+//         .status(401)
+//         .json({ success: false, message: "Invalid credentials" });
+//     }
+
+//     if (user.is_verified === 0) {
+//       console.log("[LOGIN] Account not verified.");
+//       return res
+//         .status(403)
+//         .json({ success: false, message: "Please verify your account first" });
+//     }
+
+//     console.log("[LOGIN] Generating token...");
+//     const token = generateToken(user.id);
+//     res.cookie("token", token, {
+//       httpOnly: true,
+//       secure: process.env.NODE_ENV === "production",
+//       sameSite: "strict",
+//       maxAge: 7 * 24 * 60 * 60 * 1000,
+//     });
+
+//     console.log("[LOGIN] Login success.");
+//     res.status(200).json({ success: true, message: "Login successful" });
+//   } catch (err) {
+//     logError("Login", err);
+//     res.status(500).json({
+//       success: false,
+//       message: `Login error: ${err instanceof Error ? err.message : String(err)}`,
+//     });
+//   }
+// };
+
+// /*
+// FORGOT PASSWORD
+// */
+// export const forgotPassword = async (req: Request, res: Response) => {
+//   console.log("[FORGOT-PASSWORD] Initializing...");
+//   try {
+//     const email = normalizeEmail(req.body.email || "");
+//     console.log(`[FORGOT-PASSWORD] email=${email}`);
+
+//     const [users] = await pool.query<UserRow[]>(
+//       "SELECT id FROM users WHERE email=?",
+//       [email],
+//     );
+
+//     if (users.length === 0) {
+//       console.log(
+//         "[FORGOT-PASSWORD] User not found. Sending generic success response for security.",
+//       );
+//       return res
+//         .status(200)
+//         .json({ success: true, message: "If account exists, OTP sent" });
+//     }
+
+//     console.log("[FORGOT-PASSWORD] Generating OTP...");
+//     const otp = crypto.randomInt(100000, 999999);
+//     const otpHash = await bcrypt.hash(String(otp), 10);
+
+//     console.log("[FORGOT-PASSWORD] Storing reset OTP...");
+//     await pool.query(
+//       `DELETE FROM otp_codes WHERE email=? AND purpose='reset_password'`,
+//       [email],
+//     );
+//     await pool.query(
+//       `INSERT INTO otp_codes (email, role, purpose, otp_hash, expires_at) VALUES (?, 'user', 'reset_password', ?, DATE_ADD(NOW(), INTERVAL 5 MINUTE))`,
+//       [email, otpHash],
+//     );
+
+//     await sendOTPEmail(email, otp);
+//     console.log("[FORGOT-PASSWORD] Success.");
+//     res
+//       .status(200)
+//       .json({ success: true, message: "If account exists, OTP sent" });
+//   } catch (err) {
+//     logError("ForgotPassword", err);
+//     res.status(500).json({
+//       success: false,
+//       message: `Error: ${err instanceof Error ? err.message : String(err)}`,
+//     });
+//   }
+// };
+
+// /*
+// RESET PASSWORD
+// */
+// export const resetPassword = async (req: Request, res: Response) => {
+//   console.log("[RESET-PASSWORD] Starting...");
+//   const email = normalizeEmail(req.body.email || "");
+//   const { otp, password: newPassword } = req.body;
+
+//   if (String(otp).length !== 6) {
+//     console.log("[RESET-PASSWORD] Validation failed: OTP length");
+//     return res
+//       .status(400)
+//       .json({ success: false, message: "Invalid OTP format" });
+//   }
+
+//   const connection = await pool.getConnection();
+//   try {
+//     console.log("[RESET-PASSWORD] Starting transaction...");
+//     await connection.beginTransaction();
+
+//     const [rows] = await connection.query<OTPRow[]>(
+//       `SELECT otp_hash FROM otp_codes WHERE email=? AND purpose='reset_password' AND expires_at > NOW() FOR UPDATE`,
+//       [email],
+//     );
+
+//     if (rows.length === 0) {
+//       console.log("[RESET-PASSWORD] OTP expired/invalid. Rolling back...");
+//       await connection.rollback();
+//       return res.status(410).json({ success: false, message: "OTP expired" });
+//     }
+
+//     const valid = await bcrypt.compare(String(otp), rows[0].otp_hash);
+//     if (!valid) {
+//       console.log("[RESET-PASSWORD] OTP mismatch. Rolling back...");
+//       await connection.rollback();
+//       return res.status(401).json({ success: false, message: "Invalid OTP" });
+//     }
+
+//     // --- NEW: OLD PASSWORD DETECTION START ---
+//     console.log(
+//       "[RESET-PASSWORD] Checking if new password matches old password...",
+//     );
+//     const [userRows] = await connection.query<UserRow[]>(
+//       "SELECT password FROM users WHERE email=? FOR UPDATE",
+//       [email],
+//     );
+
+//     if (userRows.length > 0) {
+//       const isSamePassword = await bcrypt.compare(
+//         newPassword,
+//         userRows[0].password,
+//       );
+//       if (isSamePassword) {
+//         console.log("[RESET-PASSWORD] Same password detected. Rolling back...");
+//         await connection.rollback();
+//         return res.status(400).json({
+//           success: false,
+//           message: "New password cannot be the same as your current password",
+//         });
+//       }
+//     }
+//     // --- NEW: OLD PASSWORD DETECTION END ---
+
+//     console.log("[RESET-PASSWORD] Hashing new password and updating user...");
+//     const hashed = await bcrypt.hash(newPassword, 10);
+//     await connection.query(`UPDATE users SET password=? WHERE email=?`, [
+//       hashed,
+//       email,
+//     ]);
+//     await connection.query(
+//       `DELETE FROM otp_codes WHERE email=? AND purpose='reset_password'`,
+//       [email],
+//     );
+
+//     console.log("[RESET-PASSWORD] Committing...");
+//     await connection.commit();
+//     res
+//       .status(200)
+//       .json({ success: true, message: "Password updated successfully" });
+//   } catch (err) {
+//     console.log("[RESET-PASSWORD] Catch block triggered.");
+//     await connection.rollback();
+//     logError("ResetPassword", err);
+//     res.status(500).json({
+//       success: false,
+//       message: `Reset failed: ${err instanceof Error ? err.message : String(err)}`,
+//     });
+//   } finally {
+//     connection.release();
+//     console.log("[RESET-PASSWORD] Connection released.");
+//   }
+// };
+// /*
+// RESEND OTP
+// */
+// export const resendOTP = async (req: Request, res: Response) => {
+//   console.log("[RESEND-OTP] Initializing...");
+//   const { purpose } = req.body;
+//   const email = normalizeEmail(req.body.email || "");
+
+//   const connection = await pool.getConnection();
+//   try {
+//     console.log("[RESEND-OTP] Checking user and verification status...");
+//     await connection.beginTransaction();
+
+//     const [user] = await connection.query<UserRow[]>(
+//       "SELECT is_verified FROM users WHERE email=? FOR UPDATE",
+//       [email],
+//     );
+//     if (user.length === 0) {
+//       console.log("[RESEND-OTP] User not found. Rolling back.");
+//       await connection.rollback();
+//       return res
+//         .status(200)
+//         .json({ success: true, message: "If account exists, new OTP sent" });
+//     }
+
+//     if (purpose === "register" && user[0].is_verified === 1) {
+//       console.log("[RESEND-OTP] User already verified. Rolling back.");
+//       await connection.rollback();
+//       return res
+//         .status(400)
+//         .json({ success: false, message: "Account already verified" });
+//     }
+
+//     console.log("[RESEND-OTP] Checking rate limit...");
+//     const [existingOTP] = await connection.query<RowDataPacket[]>(
+//       "SELECT created_at FROM otp_codes WHERE email=? AND purpose=? AND created_at > DATE_SUB(NOW(), INTERVAL 1 MINUTE)",
+//       [email, purpose],
+//     );
+
+//     if (existingOTP.length > 0) {
+//       console.log("[RESEND-OTP] Rate limit hit. Rolling back.");
+//       await connection.rollback();
+//       return res
+//         .status(429)
+//         .json({ success: false, message: "Wait 1 minute before resending" });
+//     }
+
+//     console.log("[RESEND-OTP] Generating new OTP...");
+//     const otp = crypto.randomInt(100000, 999999);
+//     const otpHash = await bcrypt.hash(String(otp), 10);
+
+//     await connection.query(
+//       "DELETE FROM otp_codes WHERE email=? AND purpose=?",
+//       [email, purpose],
+//     );
+//     await connection.query(
+//       `INSERT INTO otp_codes (email, role, purpose, otp_hash, expires_at) VALUES (?, 'user', ?, ?, DATE_ADD(NOW(), INTERVAL 5 MINUTE))`,
+//       [email, purpose, otpHash],
+//     );
+
+//     console.log("[RESEND-OTP] Committing and sending email...");
+//     await connection.commit();
+//     await sendOTPEmail(email, otp);
+
+//     res.status(200).json({ success: true, message: "OTP resent successfully" });
+//   } catch (err) {
+//     console.log("[RESEND-OTP] Catch block triggered.");
+//     await connection.rollback();
+//     logError("ResendOTP", err);
+//     res.status(500).json({
+//       success: false,
+//       message: `Resend error: ${err instanceof Error ? err.message : String(err)}`,
+//     });
+//   } finally {
+//     connection.release();
+//     console.log("[RESEND-OTP] Connection released.");
+//   }
+// };
+
+// /*
+// LOGOUT
+// */
+// export const logout = (req: Request, res: Response) => {
+//   console.log("[LOGOUT] Clearing token cookie...");
+//   res.clearCookie("token", {
+//     httpOnly: true,
+//     secure: process.env.NODE_ENV === "production",
+//     sameSite: "strict",
+//   });
+//   console.log("[LOGOUT] Success.");
+//   res.status(200).json({ success: true, message: "Logged out" });
+// };
+
+/*
+REGISTER
+*/
+// export const register = async (req: Request, res: Response) => {
+//   console.log("[REGISTER] Starting registration process...");
+//   const { name, password, mobile_no } = req.body;
+//   const email = normalizeEmail(req.body.email || "");
+
+//   console.log(`[REGISTER] Input received: email=${email}, name=${name}`);
+
+//   if (!name || !email || !password || !mobile_no) {
+//     console.log("[REGISTER] Validation failed: Missing fields");
+//     return res
+//       .status(400)
+//       .json({ success: false, message: "All fields required" });
+//   }
+
+//   if (!emailRegex.test(email)) {
+//     console.log("[REGISTER] Validation failed: Invalid email format");
+//     return res
+//       .status(400)
+//       .json({ success: false, message: "Invalid email format" });
+//   }
+
+//   const connection = await pool.getConnection();
+//   try {
+//     console.log(
+//       "[REGISTER] Database connection acquired. Starting transaction...",
+//     );
+//     await connection.beginTransaction();
+
+//     console.log("[REGISTER] Checking if email exists...");
+//     const [exist] = await connection.query<UserRow[]>(
+//       "SELECT id FROM users WHERE email=? FOR UPDATE",
+//       [email],
+//     );
+
+//     if (exist.length > 0) {
+//       console.log("[REGISTER] Email already exists. Rolling back...");
+//       await connection.rollback();
+//       return res
+//         .status(409)
+//         .json({ success: false, message: "Email already registered" });
+//     }
+
+//     console.log("[REGISTER] Hashing password...");
+//     const hashed = await bcrypt.hash(password, 10);
+
+//     console.log("[REGISTER] Inserting new user...");
+//     await connection.query<ResultSetHeader>(
+//       `INSERT INTO users (name, email, password, mobile_no, is_verified) VALUES (?, ?, ?, ?, 0)`,
+//       [name, email, hashed, mobile_no],
+//     );
+
+//     console.log("[REGISTER] Generating secure OTP...");
+//     const otp = crypto.randomInt(100000, 999999);
+//     const otpHash = await bcrypt.hash(String(otp), 10);
+
+//     console.log("[REGISTER] Cleaning old OTPs and inserting new one...");
+//     await connection.query(
+//       `DELETE FROM otp_codes WHERE email=? AND purpose='register'`,
+//       [email],
+//     );
+//     await connection.query(
+//       `INSERT INTO otp_codes (email, role, purpose, otp_hash, expires_at) VALUES (?, 'user', 'register', ?, DATE_ADD(NOW(), INTERVAL 5 MINUTE))`,
+//       [email, otpHash],
+//     );
+
+//     console.log("[REGISTER] Committing transaction...");
+//     await connection.commit();
+
+//     console.log("[REGISTER] Attempting to send OTP email...");
+//     await sendOTPEmail(email, otp);
+
+//     console.log("[REGISTER] Success. Response sent.");
+//     res
+//       .status(201)
+//       .json({ success: true, message: "Registration successful. OTP sent" });
+//   } catch (err) {
+//     console.log("[REGISTER] Catch block triggered. Rolling back...");
+//     await connection.rollback();
+//     logError("Register", err);
+//     res.status(500).json({
+//       success: false,
+//       message: `Register error: ${err instanceof Error ? err.message : String(err)}`,
+//     });
+//   } finally {
+//     connection.release();
+//     console.log("[REGISTER] Connection released.");
+//   }
+// };
+// export const register = async (req: Request, res: Response) => {
+//   console.log("[REGISTER] Starting registration process...");
+//   const { name, password, mobile_no } = req.body;
+//   const email = normalizeEmail(req.body.email || "");
+
+//   if (!name || !email || !password || !mobile_no) {
+//     return res
+//       .status(400)
+//       .json({ success: false, message: "All fields required" });
+//   }
+
+//   if (!emailRegex.test(email)) {
+//     return res
+//       .status(400)
+//       .json({ success: false, message: "Invalid email format" });
+//   }
+
+//   const connection = await pool.getConnection();
+//   try {
+//     await connection.beginTransaction();
+
+//     console.log("[REGISTER] Checking if email exists...");
+//     // We select is_verified to check if we should let them go to the verify page
+//     const [exist] = await connection.query<UserRow[]>(
+//       "SELECT id, is_verified FROM users WHERE email=? FOR UPDATE",
+//       [email],
+//     );
+
+//     if (exist.length > 0) {
+//       const existingUser = exist[0];
+
+//       // Handle the case where they registered but never verified their email
+//       if (existingUser.is_verified === 0) {
+//         console.log("[REGISTER] User exists but not verified.");
+//         await connection.rollback();
+//         return res.status(200).json({
+//           success: false,
+//           message:
+//             "Email is already registered but not verified. Please go to the verify page.",
+//         });
+//       }
+
+//       console.log("[REGISTER] Email already exists and is verified.");
+//       await connection.rollback();
+//       return res
+//         .status(409)
+//         .json({ success: false, message: "Email already registered" });
+//     }
+
+//     const hashed = await bcrypt.hash(password, 10);
+
+//     await connection.query<ResultSetHeader>(
+//       `INSERT INTO users (name, email, password, mobile_no, is_verified) VALUES (?, ?, ?, ?, 0)`,
+//       [name, email, hashed, mobile_no],
+//     );
+
+//     const otp = crypto.randomInt(100000, 999999);
+//     const otpHash = await bcrypt.hash(String(otp), 10);
+
+//     await connection.query(
+//       `DELETE FROM otp_codes WHERE email=? AND purpose='register'`,
+//       [email],
+//     );
+//     await connection.query(
+//       `INSERT INTO otp_codes (email, role, purpose, otp_hash, expires_at) VALUES (?, 'user', 'register', ?, DATE_ADD(NOW(), INTERVAL 5 MINUTE))`,
+//       [email, otpHash],
+//     );
+
+//     await connection.commit();
+//     await sendOTPEmail(email, otp);
+
+//     res
+//       .status(201)
+//       .json({ success: true, message: "Registration successful. OTP sent" });
+//   } catch (err) {
+//     await connection.rollback();
+//     logError("Register", err);
+//     res
+//       .status(500)
+//       .json({
+//         success: false,
+//         message: "Internal server error during registration",
+//       });
+//   } finally {
+//     connection.release();
+//   }
+// };
 
 /*
 RESET PASSWORD
